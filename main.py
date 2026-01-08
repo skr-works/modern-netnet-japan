@@ -6,6 +6,7 @@ import random
 from dataclasses import dataclass
 from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
+from concurrent.futures import ThreadPoolExecutor, as_completed  # 追加: 並列処理用
 
 import numpy as np
 import pandas as pd
@@ -138,8 +139,8 @@ def get_japanese_name(ticker_code: str):
         code_t = f"{base}.T"
         url = f"https://finance.yahoo.co.jp/quote/{code_t}"
 
-        # BAN回避寄り：ごく小さなジッター（並列化しない前提）
-        time.sleep(0.03 + random.random() * 0.05)
+        # BAN回避寄り：ごく小さなジッター
+        time.sleep(0.05 + random.random() * 0.1)
 
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
         res = _HTTP_SESSION.get(url, headers=headers, timeout=5)
@@ -155,12 +156,16 @@ def get_japanese_name(ticker_code: str):
     return None
 
 
-def get_company_name_jp(ticker_code: str):
-    """企業名（日本語）を優先して取得。"""
-    name = get_japanese_name(ticker_code)
-    if name:
-        return name
-    return None
+def get_company_name_optimized(ticker_code: str, existing_name: str | None):
+    """
+    企業名取得の最適化版。
+    既にシートに名前がある場合はそれを採用し、スクレイピングをスキップする（BAN回避・高速化）。
+    """
+    if existing_name and str(existing_name).strip():
+        return str(existing_name).strip()
+    
+    # シートに名前がない場合のみスクレイピング
+    return get_japanese_name(ticker_code)
 
 
 # ----------------------------
@@ -231,25 +236,41 @@ def open_worksheet(cfg: AppConfig):
     return ws
 
 
-def read_codes_from_col_a(ws) -> list[str]:
-    col = ws.col_values(1)
-    codes = []
-    for v in col:
-        s = str(v).strip()
-        if not s:
-            continue
-        if s.lower() in ("code", "ticker", "銘柄コード", "銘柄", "銘柄code"):
-            continue
-        codes.append(s)
+def read_sheet_data(ws) -> tuple[list[str], dict[str, str]]:
+    """
+    シート全体を一括読み込みし、コードリストと既存の企業名マップ（キャッシュ）を作成する。
+    最適化: 毎回列ごとに読むのではなく、get_all_values()で1回で済ませる。
+    """
+    rows = ws.get_all_values()
+    if not rows:
+        return [], {}
 
-    # 重複除去（順序保持）
+    # ヘッダー除去（1行目）
+    data_rows = rows[1:]
+    
+    codes = []
+    name_map = {}
     seen = set()
-    out = []
-    for c in codes:
+
+    for row in data_rows:
+        # A列: コード
+        if len(row) < 1:
+            continue
+        c = str(row[0]).strip()
+        if not c:
+            continue
+        if c.lower() in ("code", "ticker", "銘柄コード", "銘柄", "銘柄code"):
+            continue
+        
+        # B列: 企業名 (存在すれば)
+        n = str(row[1]).strip() if len(row) > 1 else ""
+
         if c not in seen:
-            out.append(c)
+            codes.append(c)
             seen.add(c)
-    return out
+            name_map[c] = n # キャッシュ用
+    
+    return codes, name_map
 
 
 def write_table(ws, headers: list[str], rows: list[list]):
@@ -356,13 +377,14 @@ def build_price_cache(tickers: list[str]):
         return adv_map, last_close_map
 
     try:
+        # downloadはスレッドセーフではない場合があるが、mainで一括実行するため問題なし
         df = yf.download(
             tickers=tickers,
             period="3mo",
             interval="1d",
             auto_adjust=False,
             group_by="ticker",
-            threads=True,
+            threads=True, 
             progress=False,
         )
         if df is None or df.empty:
@@ -372,8 +394,7 @@ def build_price_cache(tickers: list[str]):
         if isinstance(df.columns, pd.MultiIndex):
             # columns: (Field, Ticker) もしくは (Ticker, Field) の揺れを吸収
             lvl0 = list(df.columns.get_level_values(0))
-            lvl1 = list(df.columns.get_level_values(1))
-
+            
             if "Close" in set(lvl0) and "Volume" in set(lvl0):
                 # (Field, Ticker)
                 for tk in tickers:
@@ -557,9 +578,12 @@ def shares_reduction_score_3y(t: yf.Ticker, now_jst: datetime) -> tuple[object, 
 
 
 # ----------------------------
-# 4) 1銘柄解析（仕様どおり）
+# 4) 1銘柄解析（最適化版）
 # ----------------------------
-def analyze_one(code: str, now_jst: datetime, adv3m_map: dict, last_close_map: dict) -> dict:
+def analyze_one(code: str, now_jst: datetime, adv3m_map: dict, last_close_map: dict, name_cache: dict) -> dict:
+    """
+    最適化: name_cacheを受け取り、既存の企業名を再利用する
+    """
     out = {"code": code}
     reasons = []
 
@@ -568,8 +592,10 @@ def analyze_one(code: str, now_jst: datetime, adv3m_map: dict, last_close_map: d
 
     t = yf.Ticker(ticker)
 
-    # 企業名（日本語を確実に優先）
-    company_jp = get_company_name_jp(ticker)
+    # 企業名（シートのキャッシュを優先 → なければスクレイピング）
+    existing_name = name_cache.get(code)
+    company_jp = get_company_name_optimized(ticker, existing_name)
+    
     if company_jp is None:
         reasons.append("NO_JP_NAME")
     out["CompanyName"] = company_jp
@@ -803,25 +829,50 @@ def main():
     cfg = load_config_from_env()
     ws = open_worksheet(cfg)
 
-    codes = read_codes_from_col_a(ws)
+    # 最適化: シート全体を読み込み、コードと既存の企業名マップを取得
+    codes, name_cache = read_sheet_data(ws)
     if not codes:
         print("No codes found in column A.")
         return
+    
+    # 2500銘柄は多いのでログ出し
+    print(f"Start processing {len(codes)} stocks at {now_jst.isoformat()}")
 
     tickers = [to_ticker(c) for c in codes]
     adv3m_map, last_close_map = build_price_cache(tickers)
 
     results = []
-    for c in codes:
-        try:
-            results.append(analyze_one(c, now_jst, adv3m_map, last_close_map))
-        except Exception as e:
-            results.append({
-                "code": c,
-                "ticker": to_ticker(c),
-                "Final": "✘",
-                "Reason": f"EXCEPTION:{type(e).__name__}",
-            })
+    
+    # 最適化: ThreadPoolExecutorで並列処理
+    # max_workers=4 は GitHub Actions (2-coreが多い) と yfinanceのレートリミット的に安全なライン
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        future_to_code = {
+            executor.submit(analyze_one, c, now_jst, adv3m_map, last_close_map, name_cache): c 
+            for c in codes
+        }
+        
+        for i, future in enumerate(as_completed(future_to_code)):
+            code = future_to_code[future]
+            try:
+                res = future.result()
+                results.append(res)
+            except Exception as e:
+                # スレッド内エラーのキャッチ
+                results.append({
+                    "code": code,
+                    "ticker": to_ticker(code),
+                    "Final": "✘",
+                    "Reason": f"EXCEPTION:{type(e).__name__}",
+                })
+            
+            # 進捗表示 (100件ごと)
+            if (i + 1) % 100 == 0:
+                print(f"Processed {i + 1}/{len(codes)}...")
+
+    # 結果を元の順序（codesの順）に戻す
+    # ThreadPoolは完了順に出てくるため、並び替えないとスプレッドシートの行とずれる可能性がある（今回は全書き換えなので問題ないが、念のため）
+    code_order = {c: i for i, c in enumerate(codes)}
+    results.sort(key=lambda x: code_order.get(x["code"], 99999))
 
     df = pd.DataFrame(results)
 
