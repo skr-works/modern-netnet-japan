@@ -400,8 +400,18 @@ def analyze_one(code: str, now_jst: datetime, name_cache: dict) -> dict:
     t = yf.Ticker(ticker)
 
     # 1. 時価総額の門前払い（fast_infoで高速チェック）
+    # yfinanceのFastInfoオブジェクトはdictではなく.get()がないため、[]でアクセスする
+    # キー名は 'marketCap'
+    mcap = None
     try:
-        mcap = t.fast_info.get("market_cap")
+        if hasattr(t, "fast_info"):
+            try:
+                mcap = t.fast_info["marketCap"]
+            except KeyError:
+                # バージョン揺れ対応
+                if "market_cap" in t.fast_info:
+                    mcap = t.fast_info["market_cap"]
+        
         if mcap is not None and mcap < 3_000_000_000:
             # 30億未満なら即リターン
             out["MarketCap"] = mcap
@@ -506,9 +516,16 @@ def analyze_one(code: str, now_jst: datetime, name_cache: dict) -> dict:
     if ocf1 is None or ocf2 is None:
         reasons.append("NO_OCF2Y")
 
-    # 配当利回り (fast_info.last_price使用)
+    # 配当利回り (fast_infoを使用。ここも[]アクセスに修正)
     try:
-        last_price = t.fast_info.get("last_price")
+        last_price = None
+        if hasattr(t, "fast_info"):
+            try:
+                last_price = t.fast_info["lastPrice"]
+            except KeyError:
+                if "last_price" in t.fast_info:
+                    last_price = t.fast_info["last_price"]
+
         if last_price and last_price > 0:
             div_series = t.dividends
             if div_series is not None and not div_series.empty:
