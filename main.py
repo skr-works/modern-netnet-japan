@@ -145,6 +145,37 @@ def fetch_yahoo_jp_data(ticker_code: str, existing_name: str | None) -> tuple[st
         return existing_name, None
 
 
+def get_market_cap_with_retry(t: yf.Ticker, max_retries=3) -> float | None:
+    """
+    時価総額をリトライ付きで取得する関数。
+    アクセス拒否(401/429)対策として、失敗時にWaitを入れて再試行する。
+    """
+    for i in range(max_retries):
+        try:
+            mcap = None
+            if hasattr(t, "fast_info"):
+                # fast_infoはdictではないため[]アクセスで取得
+                try:
+                    mcap = t.fast_info["marketCap"]
+                except KeyError:
+                    # バージョン揺れ対応
+                    if "market_cap" in t.fast_info:
+                        mcap = t.fast_info["market_cap"]
+            
+            # 取得できていれば数値を返す
+            if mcap is not None:
+                return float(mcap)
+        
+        except Exception:
+            # エラー時はスルーしてリトライへ
+            pass
+        
+        # 失敗した場合、少し待機時間を増やしてリトライ (1秒, 2秒, 3秒...)
+        time.sleep(1.0 + i)
+        
+    return None
+
+
 # ----------------------------
 # 0) 実行ガード
 # ----------------------------
@@ -386,7 +417,7 @@ def shares_reduction_score_3y(t: yf.Ticker, now_jst: datetime) -> tuple[object, 
 
 
 # ----------------------------
-# 4) 1銘柄解析（超高速化・列ズレ修正・順序修正版）
+# 4) 1銘柄解析（超高速化・列ズレ修正・順序修正・リトライ版）
 # ----------------------------
 def analyze_one(code: str, now_jst: datetime, name_cache: dict) -> dict:
     time.sleep(random.uniform(0.5, 1.5))
@@ -400,7 +431,6 @@ def analyze_one(code: str, now_jst: datetime, name_cache: dict) -> dict:
     t = yf.Ticker(ticker)
 
     # 1. 企業名と業種(JP)の取得
-    # 時価総額チェックの前に移動し、門前払いされた場合でも名前が入るように修正
     existing_name = name_cache.get(code)
     company_jp, sector_jp = fetch_yahoo_jp_data(ticker, existing_name)
     
@@ -417,24 +447,16 @@ def analyze_one(code: str, now_jst: datetime, name_cache: dict) -> dict:
     if sector_jp is None:
         reasons.append("SECTOR_UNKNOWN")
 
-    # 2. 時価総額の門前払い（fast_infoで高速チェック）
-    mcap = None
-    try:
-        if hasattr(t, "fast_info"):
-            try:
-                mcap = t.fast_info["marketCap"]
-            except KeyError:
-                if "market_cap" in t.fast_info:
-                    mcap = t.fast_info["market_cap"]
-        
-        if mcap is not None and mcap < 3_000_000_000:
-            out["MarketCap"] = mcap
-            out["Size_OK"] = False
-            out["Final"] = "✘"
-            out["Reason"] = "SIZE<30億"
-            return out
-    except Exception:
-        mcap = None
+    # 2. 時価総額の門前払い（リトライ機能付き）
+    # 大量アクセスでNoneが返りやすいため、リトライで粘る
+    mcap = get_market_cap_with_retry(t, max_retries=3)
+    
+    if mcap is not None and mcap < 3_000_000_000:
+        out["MarketCap"] = mcap
+        out["Size_OK"] = False
+        out["Final"] = "✘"
+        out["Reason"] = "SIZE<30億"
+        return out
     
     out["MarketCap"] = mcap
     size_ok = (mcap is not None) and (mcap >= 3_000_000_000)
