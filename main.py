@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from dataclasses import dataclass
 from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
@@ -12,6 +13,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 import holidays
+import requests
 
 JST = ZoneInfo("Asia/Tokyo")
 
@@ -63,6 +65,11 @@ def _to_oku(v):
     if v is None:
         return None
     try:
+        # "123,456" 等にも耐える
+        if isinstance(v, str):
+            v = v.replace(",", "").strip()
+            if v == "":
+                return None
         return float(v) / 1e8
     except Exception:
         return None
@@ -101,12 +108,72 @@ def _reason_jp(reason_csv: str) -> str:
     return "、".join(uniq)
 
 
+def _has_japanese(s: str) -> bool:
+    if not s:
+        return False
+    return re.search(r"[\u3040-\u30FF\u4E00-\u9FFF]", s) is not None
+
+
+def _fetch_company_name_jp_from_yahoo(ticker: str):
+    """
+    finance.yahoo.co.jp から日本語社名を引くフォールバック。
+    取れない場合は None。
+    """
+    try:
+        url = f"https://finance.yahoo.co.jp/quote/{ticker}"
+        r = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200:
+            return None
+        html = r.text
+        # <title>住友商事(8053.T) ...</title> を想定して先頭を抜く
+        m = re.search(r"<title>\s*([^<]+?)\s*\(", html, flags=re.IGNORECASE)
+        if not m:
+            return None
+        name = m.group(1).strip()
+        if name and _has_japanese(name):
+            return name
+        return None
+    except Exception:
+        return None
+
+
 def get_company_name(t: yf.Ticker):
     """企業名（可能なら日本語名）"""
     try:
         info = t.get_info()
-        name = info.get("longName") or info.get("shortName") or info.get("name")
-        return str(name).strip() if name else None
+
+        # まずはyfinanceが返す候補を幅広く見る（日本語があればそれを採用）
+        candidates = [
+            info.get("longName"),
+            info.get("shortName"),
+            info.get("displayName"),
+            info.get("name"),
+        ]
+        for c in candidates:
+            if c:
+                s = str(c).strip()
+                if _has_japanese(s):
+                    return s
+
+        # 次に英語名（fallback）
+        en = None
+        for c in candidates:
+            if c:
+                en = str(c).strip()
+                if en:
+                    break
+
+        # 最後に finance.yahoo.co.jp から日本語名を拾う（取れれば上書き）
+        try:
+            sym = info.get("symbol") or getattr(t, "ticker", None)
+            if sym:
+                jp = _fetch_company_name_jp_from_yahoo(str(sym).strip())
+                if jp:
+                    return jp
+        except Exception:
+            pass
+
+        return en
     except Exception:
         return None
 
@@ -455,7 +522,7 @@ def analyze_one(code: str, now_jst: datetime) -> dict:
 
     t = yf.Ticker(ticker)
 
-    # 企業名（追加）
+    # 企業名（追加：可能なら日本語）
     company = get_company_name(t)
     out["CompanyName"] = company
 
@@ -800,10 +867,14 @@ def main():
         "OCF_FY2",
     ]
     for c in oku_cols:
-        d[c] = d[c].apply(_to_oku)
+        # ここが今回の修正点：文字列混入でも取りこぼさないよう、先に数値化してから億円へ
+        d[c] = pd.to_numeric(d[c], errors="coerce").apply(_to_oku)
 
     # Reason 日本語化
     d["ReasonJP"] = d["Reason"].apply(_reason_jp)
+
+    # Sharesスコアは None のとき空欄に
+    shares_score_disp = d["Shares_Reduction_Score"].where(pd.notna(d["Shares_Reduction_Score"]), "")
 
     # 出力順（日本語ヘッダー順に揃える）
     out_df = pd.DataFrame({
@@ -840,7 +911,7 @@ def main():
         "配当利回り": d["DividendYield"],
         "配当2%OK": d["Dividend_OK"],
         "過去3年分割/併合": d["Split_3Y_Flag"],
-        "株数減少スコア(0-3)": d["Shares_Reduction_Score"],
+        "株数減少スコア(0-3)": shares_score_disp,
         "最終判定": d["Final"],
         "理由": d["ReasonJP"],
     }).replace({np.nan: None})
