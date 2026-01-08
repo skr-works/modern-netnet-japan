@@ -703,11 +703,12 @@ def main():
 
     df = pd.DataFrame(results)
 
-    # 日本語ヘッダー (業種に変更、英語Industry削除済)
+    # 日本語ヘッダー (最終判定を移動)
     jp_headers = [
         "銘柄コード",
         "企業名",
         "業種",
+        "最終判定",
         "時価総額(億円)",
         "時価総額OK",
         "セクターOK",
@@ -734,7 +735,6 @@ def main():
         "配当2%OK",
         "過去3年分割/併合",
         "株数減少スコア(0-3)",
-        "最終判定",
         "理由",
     ]
 
@@ -742,6 +742,7 @@ def main():
         "code",
         "CompanyName",
         "SectorJP",
+        "Final",
         "MarketCap",
         "Size_OK",
         "Sector_OK",
@@ -768,7 +769,6 @@ def main():
         "Dividend_OK",
         "Split_3Y_Flag",
         "Shares_Reduction_Score",
-        "Final",
         "Reason",
     ]
     for c in needed:
@@ -804,6 +804,7 @@ def main():
         "銘柄コード": d["code"],
         "企業名": d["CompanyName"],
         "業種": d["SectorJP"],
+        "最終判定": d["Final"],
         "時価総額(億円)": d["MarketCap"],
         "時価総額OK": d["Size_OK"],
         "セクターOK": d["Sector_OK"],
@@ -830,7 +831,6 @@ def main():
         "配当2%OK": d["Dividend_OK"],
         "過去3年分割/併合": d["Split_3Y_Flag"],
         "株数減少スコア(0-3)": d["Shares_Reduction_Score"],
-        "最終判定": d["Final"],
         "理由": d["ReasonJP"],
     }).replace({np.nan: None})
 
