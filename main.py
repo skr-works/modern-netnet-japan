@@ -22,36 +22,23 @@ from urllib3.util.retry import Retry
 
 JST = ZoneInfo("Asia/Tokyo")
 
-
 # --- 日本語化・表示変換（出力用） -----------------
 
-SECTOR_JP_MAP = {
-    "Basic Materials": "素材",
-    "Communication Services": "通信サービス",
-    "Consumer Cyclical": "一般消費財",
-    "Consumer Defensive": "生活必需品",
-    "Energy": "エネルギー",
-    "Financial Services": "金融",
-    "Healthcare": "ヘルスケア",
-    "Industrials": "資本財・サービス",
-    "Real Estate": "不動産",
-    "Technology": "情報技術",
-    "Utilities": "公益事業",
-}
-
-# Industryは粒度が細かく全網羅は難しいため、代表的なものだけマップし、未定義は原文を出す
-INDUSTRY_JP_MAP = {
-    "Conglomerates": "複合企業",
-    "Oil & Gas E&P": "石油・ガス（探鉱・生産）",
-}
+# 東証33業種リスト（スクレイピング時のマッチング用）
+TSE_SECTORS = [
+    "水産・農林業", "鉱業", "建設業", "食料品", "繊維製品", "パルプ・紙", "化学",
+    "医薬品", "石油・石炭製品", "ゴム製品", "ガラス・土石製品", "鉄鋼", "非鉄金属",
+    "金属製品", "機械", "電気機器", "輸送用機器", "精密機器", "その他製品",
+    "電気・ガス業", "陸運業", "海運業", "空運業", "倉庫・運輸関連業", "情報・通信業",
+    "卸売業", "小売業", "銀行業", "証券、商品先物取引業", "保険業",
+    "その他金融業", "不動産業", "サービス業"
+]
 
 REASON_JP_MAP = {
     "SECTOR_UNKNOWN": "セクター取得不可",
     "FINANCIAL_SECTOR_EXCLUDED": "金融セクター除外",
     "NO_MCAP": "時価総額取得不可",
     "SIZE<30億": "時価総額30億未満",
-    "NO_ADV3M": "平均日次売買代金（3か月）取得不可",
-    "LIQ<1000万": "平均日次売買代金1,000万円未満",
     "NO_OCF2Y": "営業CF（直近2年）取得不可",
     "NO_DIV_YIELD": "配当利回り取得不可",
     "NO_CASH": "現金（Cash）取得不可",
@@ -76,30 +63,16 @@ def _to_oku(v):
         return None
 
 
-def _sector_jp(sector_raw):
-    if sector_raw is None:
-        return None
-    return SECTOR_JP_MAP.get(sector_raw, sector_raw)
-
-
-def _industry_jp(industry_raw):
-    if industry_raw is None:
-        return None
-    return INDUSTRY_JP_MAP.get(industry_raw, industry_raw)
-
-
 def _reason_jp(reason_csv: str) -> str:
     if not reason_csv:
         return ""
     parts = [p.strip() for p in str(reason_csv).split(",") if p.strip()]
     out = []
     for p in parts:
-        # EXCEPTION:〇〇 はプレフィクス一致で日本語化
         if p.startswith("EXCEPTION:"):
             out.append(REASON_JP_MAP["EXCEPTION:"] + f"（{p}）")
         else:
             out.append(REASON_JP_MAP.get(p, p))
-    # 重複除去（順序保持）
     seen = set()
     uniq = []
     for x in out:
@@ -109,7 +82,7 @@ def _reason_jp(reason_csv: str) -> str:
     return "、".join(uniq)
 
 
-# --- HTTPセッション（企業名スクレイピングの安定化・軽いリトライ） ---
+# --- HTTPセッション ---
 _HTTP_SESSION = requests.Session()
 _retry = Retry(
     total=2,
@@ -121,16 +94,16 @@ _HTTP_SESSION.mount("https://", HTTPAdapter(max_retries=_retry))
 _HTTP_SESSION.mount("http://", HTTPAdapter(max_retries=_retry))
 
 
-def get_japanese_name(ticker_code: str):
+def fetch_yahoo_jp_data(ticker_code: str, existing_name: str | None) -> tuple[str | None, str | None]:
     """
-    Yahoo!ファイナンス(日本)からスクレイピングで銘柄名(日本語)を取得する
+    Yahoo!ファイナンス(日本)から企業名とセクター(業種)を取得する。
+    1回のリクエストで両方探す。
     """
     try:
         s = str(ticker_code).strip()
         if not s:
-            return None
+            return None, None
 
-        # 8053.T / 465A.T → 8053.T / 465A.T の形に寄せる
         if "." in s:
             base = s.split(".", 1)[0]
         else:
@@ -139,81 +112,80 @@ def get_japanese_name(ticker_code: str):
         code_t = f"{base}.T"
         url = f"https://finance.yahoo.co.jp/quote/{code_t}"
 
-        # BAN回避寄り：ごく小さなジッター
-        time.sleep(0.05 + random.random() * 0.1)
+        # 401/429回避のためのジッター（呼び出し元でもWaitを入れるが念のため）
+        time.sleep(random.uniform(0.05, 0.1))
 
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
         res = _HTTP_SESSION.get(url, headers=headers, timeout=5)
         res.encoding = res.apparent_encoding
+        html = res.text
 
-        # <title>住友商事(株)【8053】：株価・株式情報 - Yahoo!ファイナンス</title>
-        m = re.search(r"<title>\s*(.*?)\s*(?:【|\|)", res.text, flags=re.IGNORECASE | re.DOTALL)
-        if m:
-            name = re.sub(r"\s+", " ", m.group(1)).strip()
-            return name if name else None
+        # 1. 企業名 (<title>から抽出)
+        name = existing_name
+        if not name:
+            m_title = re.search(r"<title>\s*(.*?)\s*(?:【|\|)", html, flags=re.IGNORECASE | re.DOTALL)
+            if m_title:
+                name = re.sub(r"\s+", " ", m_title.group(1)).strip()
+
+        # 2. セクター (HTML内のテキストから東証33業種を探す)
+        sector = None
+        # HTMLタグのコンテンツとして業種が含まれている箇所を探す簡易的な判定
+        # 誤爆を防ぐため ">業種名<" のような形を優先して探す
+        for candidate in TSE_SECTORS:
+            # 単純検索（YahooファイナンスのHTML構造上、業種名はリンク等のテキストになっていることが多い）
+            if f">{candidate}<" in html or f"\"{candidate}\"" in html:
+                sector = candidate
+                break
+        
+        # 見つからなければ単純検索（リスクはあるがカバレッジ優先）
+        if not sector:
+            for candidate in TSE_SECTORS:
+                if candidate in html:
+                    sector = candidate
+                    break
+
+        return name, sector
+
     except Exception:
-        pass
-    return None
-
-
-def get_company_name_optimized(ticker_code: str, existing_name: str | None):
-    """
-    企業名取得の最適化版。
-    既にシートに名前がある場合はそれを採用し、スクレイピングをスキップする（BAN回避・高速化）。
-    """
-    if existing_name and str(existing_name).strip():
-        return str(existing_name).strip()
-    
-    # シートに名前がない場合のみスクレイピング
-    return get_japanese_name(ticker_code)
+        return existing_name, None
 
 
 # ----------------------------
-# 0) 実行ガード（週末・祝日・年末年始）
+# 0) 実行ガード
 # ----------------------------
 def should_skip_run(now_jst: datetime) -> tuple[bool, str]:
     d = now_jst.date()
-
-    # 週末
     if d.weekday() >= 5:
         return True, "WEEKEND"
-
-    # 年末年始（12/31〜1/3）
     if (d.month == 12 and d.day == 31) or (d.month == 1 and d.day in (1, 2, 3)):
         return True, "YEAR_END_HOLIDAY"
-
-    # 日本の祝日
     jp_holidays = holidays.country_holidays("JP")
     if d in jp_holidays:
         return True, f"JP_HOLIDAY:{jp_holidays.get(d)}"
-
     return False, ""
 
 
 # ----------------------------
-# 1) Secrets（1つ）読み込み：JSON直貼り版
+# 1) Secrets読み込み
 # ----------------------------
 @dataclass
 class AppConfig:
-    id: str       # spreadsheet id
-    tab: str      # worksheet name
-    sa: dict      # service account json
+    id: str
+    tab: str
+    sa: dict
 
 
 def load_config_from_env() -> AppConfig:
     raw = (os.environ.get("APP_CFG_JSON") or "").strip()
     if not raw:
         raise RuntimeError("Missing env APP_CFG_JSON (GitHub Secret)")
-
     try:
         cfg = json.loads(raw)
     except Exception as e:
         raise RuntimeError(f"APP_CFG_JSON is not valid JSON: {e}")
-
     for k in ("id", "tab", "sa"):
         if k not in cfg:
             raise RuntimeError(f"APP_CFG_JSON missing key: {k}")
-
     return AppConfig(
         id=str(cfg["id"]).strip(),
         tab=str(cfg["tab"]).strip(),
@@ -237,23 +209,14 @@ def open_worksheet(cfg: AppConfig):
 
 
 def read_sheet_data(ws) -> tuple[list[str], dict[str, str]]:
-    """
-    シート全体を一括読み込みし、コードリストと既存の企業名マップ（キャッシュ）を作成する。
-    最適化: 毎回列ごとに読むのではなく、get_all_values()で1回で済ませる。
-    """
     rows = ws.get_all_values()
     if not rows:
         return [], {}
-
-    # ヘッダー除去（1行目）
     data_rows = rows[1:]
-    
     codes = []
     name_map = {}
     seen = set()
-
     for row in data_rows:
-        # A列: コード
         if len(row) < 1:
             continue
         c = str(row[0]).strip()
@@ -261,15 +224,11 @@ def read_sheet_data(ws) -> tuple[list[str], dict[str, str]]:
             continue
         if c.lower() in ("code", "ticker", "銘柄コード", "銘柄", "銘柄code"):
             continue
-        
-        # B列: 企業名 (存在すれば)
         n = str(row[1]).strip() if len(row) > 1 else ""
-
         if c not in seen:
             codes.append(c)
             seen.add(c)
-            name_map[c] = n # キャッシュ用
-    
+            name_map[c] = n
     return codes, name_map
 
 
@@ -290,7 +249,6 @@ def pick_bs_value(bs: pd.DataFrame, candidates: list[str]):
         return None
     latest_col = bs.columns[0]
     idx_map = {normalize_key(i): i for i in bs.index}
-
     for name in candidates:
         k = normalize_key(name)
         if k in idx_map:
@@ -333,171 +291,16 @@ def to_ticker(code: str) -> str:
     return f"{s}.T"
 
 
-def get_info_safe(t: yf.Ticker):
-    try:
-        info = t.get_info()
-        return info if isinstance(info, dict) else {}
-    except Exception:
-        return {}
-
-
-def get_market_cap(t: yf.Ticker, info: dict | None = None):
-    try:
-        fi = getattr(t, "fast_info", {}) or {}
-        mc = fi.get("market_cap")
-        if mc is not None:
-            return float(mc)
-    except Exception:
-        pass
-
-    if info is None:
-        info = get_info_safe(t)
-
-    try:
-        mc = info.get("marketCap")
-        if mc is not None:
-            return float(mc)
-    except Exception:
-        pass
-
-    return None
-
-
-def get_sector_industry(info: dict):
-    try:
-        sector = info.get("sector")
-        industry = info.get("industry")
-        return (str(sector).strip() if sector else None), (str(industry).strip() if industry else None)
-    except Exception:
-        return None, None
-
-
-def build_price_cache(tickers: list[str]):
-    """
-    レートリミット回避のため、100銘柄ずつ分割して取得する
-    """
-    adv_map = {}
-    last_close_map = {}
-    if not tickers:
-        return adv_map, last_close_map
-
-    # Chunking to avoid "Failed downloads" and 429 errors
-    chunk_size = 100
-    for i in range(0, len(tickers), chunk_size):
-        chunk = tickers[i : i + chunk_size]
-        try:
-            # サーバー負荷を下げるため少しWait
-            if i > 0:
-                time.sleep(1.5)
-
-            df = yf.download(
-                tickers=chunk,
-                period="3mo",
-                interval="1d",
-                auto_adjust=False,
-                group_by="ticker",
-                threads=True, 
-                progress=False,
-            )
-            if df is None or df.empty:
-                continue
-
-            # 1銘柄の場合と複数銘柄で構造が変わるので吸収
-            if isinstance(df.columns, pd.MultiIndex):
-                # columns: (Field, Ticker) もしくは (Ticker, Field) の揺れを吸収
-                lvl0 = list(df.columns.get_level_values(0))
-                
-                if "Close" in set(lvl0) and "Volume" in set(lvl0):
-                    # (Field, Ticker)
-                    for tk in chunk:
-                        try:
-                            c = df[("Close", tk)].dropna()
-                            v = df[("Volume", tk)].dropna()
-                            if c.empty or v.empty:
-                                continue
-                            dv = (c * v).dropna()
-                            if not dv.empty:
-                                adv_map[tk] = float(dv.mean())
-                            if not c.empty:
-                                last_close_map[tk] = float(c.iloc[-1])
-                        except Exception:
-                            continue
-                else:
-                    # (Ticker, Field)
-                    for tk in chunk:
-                        try:
-                            if (tk, "Close") not in df.columns or (tk, "Volume") not in df.columns:
-                                continue
-                            c = df[(tk, "Close")].dropna()
-                            v = df[(tk, "Volume")].dropna()
-                            if c.empty or v.empty:
-                                continue
-                            dv = (c * v).dropna()
-                            if not dv.empty:
-                                adv_map[tk] = float(dv.mean())
-                            if not c.empty:
-                                last_close_map[tk] = float(c.iloc[-1])
-                        except Exception:
-                            continue
-            else:
-                # 単一銘柄(chunk size=1 or result is single)
-                try:
-                    tk = chunk[0] # 単一なら最初のTickerと仮定
-                    if "Close" in df.columns and "Volume" in df.columns:
-                        c = df["Close"].dropna()
-                        v = df["Volume"].dropna()
-                        dv = (c * v).dropna()
-                        if not dv.empty:
-                            adv_map[tk] = float(dv.mean())
-                        if not c.empty:
-                            last_close_map[tk] = float(c.iloc[-1])
-                except Exception:
-                    pass
-        except Exception as e:
-            print(f"Chunk download failed: {e}")
-            continue
-
-    return adv_map, last_close_map
-
-
-def dividend_yield_trailing(t: yf.Ticker, info: dict, last_close: float | None):
-    try:
-        dy = info.get("dividendYield")
-        if dy is not None:
-            dyf = float(dy)
-            if 0 <= dyf <= 1:
-                return dyf
-    except Exception:
-        pass
-
-    try:
-        div = t.dividends
-        if div is None or div.empty:
-            return 0.0
-        cutoff = pd.Timestamp.utcnow() - pd.Timedelta(days=365)
-        div_1y = div[div.index >= cutoff]
-        total = float(div_1y.sum()) if not div_1y.empty else 0.0
-
-        price = last_close
-        if price is None or price <= 0:
-            return None
-        return total / price
-    except Exception:
-        return None
-
-
 def operating_cf_two_years(t: yf.Ticker):
     cf = get_cashflow_annual(t)
     if cf is None or cf.empty:
         return None, None
-
     candidates = [
         "Total Cash From Operating Activities",
         "Operating Cash Flow",
         "Net Cash Provided By Operating Activities",
         "Cash Flow From Continuing Operating Activities",
     ]
-
     idx_map = {normalize_key(i): i for i in cf.index}
     row = None
     for name in candidates:
@@ -507,7 +310,6 @@ def operating_cf_two_years(t: yf.Ticker):
             break
     if row is None:
         return None, None
-
     cols = list(cf.columns)
     try:
         v1 = row[cols[0]] if len(cols) >= 1 else None
@@ -542,19 +344,17 @@ def shares_reduction_score_3y(t: yf.Ticker, now_jst: datetime) -> tuple[object, 
         df = t.get_shares_full(start=start)
         if df is None or df.empty:
             return None, "NO_SHARES"
-
         if "Shares" in df.columns:
             s = df["Shares"].copy()
         elif df.shape[1] == 1:
             s = df.iloc[:, 0].copy()
         else:
             return None, "NO_SHARES"
-
         s.index = pd.to_datetime(s.index, errors="coerce")
         s = s.dropna().sort_index()
         if s.empty:
             return None, "NO_SHARES"
-
+        
         def nearest_value(target_date: date):
             tts = pd.Timestamp(target_date)
             after = s[s.index >= tts]
@@ -585,17 +385,16 @@ def shares_reduction_score_3y(t: yf.Ticker, now_jst: datetime) -> tuple[object, 
                 score = 2
                 if p2 < p3:
                     score = 3
-
         return score, ""
     except Exception:
         return None, "NO_SHARES"
 
 
 # ----------------------------
-# 4) 1銘柄解析（最適化・安定化版）
+# 4) 1銘柄解析（超高速化版）
 # ----------------------------
-def analyze_one(code: str, now_jst: datetime, adv3m_map: dict, last_close_map: dict, name_cache: dict) -> dict:
-    # 401/429エラー回避のためのランダムWait（ジッター）
+def analyze_one(code: str, now_jst: datetime, name_cache: dict) -> dict:
+    # API負荷分散のためのWait
     time.sleep(random.uniform(0.5, 1.5))
     
     out = {"code": code}
@@ -606,59 +405,68 @@ def analyze_one(code: str, now_jst: datetime, adv3m_map: dict, last_close_map: d
 
     t = yf.Ticker(ticker)
 
-    # 企業名（シートのキャッシュを優先 → なければスクレイピング）
+    # 1. 時価総額の門前払い（fast_infoで高速チェック）
+    # ---------------------------------------------------
+    try:
+        # get_infoを使わず、API経由のfast_infoで取得
+        mcap = t.fast_info.get("market_cap")
+        # Noneの場合は取得失敗として扱うが、念のため次のステップへ。数値があり30億未満なら即終了。
+        if mcap is not None and mcap < 3_000_000_000:
+            out["MarketCap"] = mcap
+            # 必要な最低限のカラムを埋めてリターン
+            out["Final"] = "✘"
+            out["Reason"] = "SIZE<30億"
+            return out
+    except Exception:
+        mcap = None
+    
+    out["MarketCap"] = mcap
+    size_ok = (mcap is not None) and (mcap >= 3_000_000_000)
+    if mcap is None:
+        reasons.append("NO_MCAP")
+    elif not size_ok:
+        reasons.append("SIZE<30億")
+
+    # 2. 企業名とセクターの取得（Yahoo JPからスクレイピング）
+    # ---------------------------------------------------
     existing_name = name_cache.get(code)
-    company_jp = get_company_name_optimized(ticker, existing_name)
+    # 名前とセクターをまとめて取りに行く
+    company_jp, sector_jp = fetch_yahoo_jp_data(ticker, existing_name)
     
     if company_jp is None:
         reasons.append("NO_JP_NAME")
     out["CompanyName"] = company_jp
+    out["SectorJP"] = sector_jp
 
-    # infoは1回だけ取得（get_info多重呼び出しを削減）
-    info = get_info_safe(t)
-
-    # セクター/業種（判定は英語の生値で行い、表示は日本語化した値を別列に出す）
-    sector_raw, industry_raw = get_sector_industry(info)
-    out["SectorRaw"] = sector_raw
-    out["IndustryRaw"] = industry_raw
-    out["SectorJP"] = _sector_jp(sector_raw)
-    out["IndustryJP"] = _industry_jp(industry_raw)
-
-    sector_ok = (sector_raw is not None) and (sector_raw != "Financial Services")
-    if sector_raw is None:
-        reasons.append("SECTOR_UNKNOWN")
-    elif sector_raw == "Financial Services":
+    sector_ok = (sector_jp is not None)
+    # 金融などの除外判定は日本語セクター名で行う
+    # 代表的な金融系ワードが含まれていればNGとする簡易判定
+    if sector_jp and any(x in sector_jp for x in ["銀行", "証券", "保険", "金融"]):
+        sector_ok = False
         reasons.append("FINANCIAL_SECTOR_EXCLUDED")
+    if sector_jp is None:
+        reasons.append("SECTOR_UNKNOWN")
 
-    mcap = get_market_cap(t, info=info)
-
-    # 3か月平均日次売買代金は、download一括取得したキャッシュを優先
-    adv3m = adv3m_map.get(ticker)
-
-    out["MarketCap"] = mcap
-    out["AvgDailyValue3M"] = adv3m
-
-    size_ok = (mcap is not None) and (mcap >= 3_000_000_000)  # 30億
-    if mcap is None:
-        reasons.append("NO_MCAP")
-    elif mcap < 3_000_000_000:
-        reasons.append("SIZE<30億")
-
-    liq_ok = (adv3m is not None) and (adv3m >= 10_000_000)  # 1000万
-    if adv3m is None:
-        reasons.append("NO_ADV3M")
-    elif adv3m < 10_000_000:
-        reasons.append("LIQ<1000万")
+    # 3. 財務データの取得（時価総額クリア時のみ）
+    # ---------------------------------------------------
+    if not size_ok:
+        # ここに来ることは基本ないが念のためガード
+        out["Final"] = "✘"
+        out["Reason"] = ",".join(reasons)
+        return out
 
     bs = get_latest_balance_sheet(t)
 
     cash = pick_bs_value(bs, ["Cash And Cash Equivalents", "Cash And Cash Equivalents And Short Term Investments", "Cash"])
-    sti = pick_bs_value(bs, ["Short Term Investments", "Short-term Investments", "Short Term Investments And Other Short Term Investments"])
+    # 短期投資は個別取得を廃止（None/0として扱う -> その他流動資産に吸収され25%評価となる）
+    sti = 0.0 
+    
     receivables = pick_bs_value(bs, ["Net Receivables", "Accounts Receivable", "Receivables"])
     inventory = pick_bs_value(bs, ["Inventory"])
     other_ca = pick_bs_value(bs, ["Other Current Assets", "Other current assets"])
     total_ca = pick_bs_value(bs, ["Total Current Assets", "Current Assets"])
 
+    # その他流動資産の計算（短期投資が0なので、その分ここに計上される）
     if other_ca is None and total_ca is not None:
         parts = [cash or 0.0, sti or 0.0, receivables or 0.0, inventory or 0.0]
         other_ca = total_ca - sum(parts)
@@ -690,7 +498,6 @@ def analyze_one(code: str, now_jst: datetime, adv3m_map: dict, last_close_map: d
         minority_used = minority
 
     out["Cash"] = cash
-    out["ShortTermInvestments"] = sti
     out["Receivables"] = receivables
     out["Inventory"] = inventory
     out["OtherCurrentAssets"] = other_ca
@@ -709,8 +516,24 @@ def analyze_one(code: str, now_jst: datetime, adv3m_map: dict, last_close_map: d
     if ocf1 is None or ocf2 is None:
         reasons.append("NO_OCF2Y")
 
-    last_close = last_close_map.get(ticker)
-    dy = dividend_yield_trailing(t, info=info, last_close=last_close)
+    # 配当利回り: fast_infoの現在株価を使用
+    try:
+        last_price = t.fast_info.get("last_price")
+        if last_price and last_price > 0:
+            # 直近1年の配当合計
+            div_series = t.dividends
+            if div_series is not None and not div_series.empty:
+                cutoff = pd.Timestamp.utcnow() - pd.Timedelta(days=365)
+                div_1y = div_series[div_series.index >= cutoff]
+                div_total = float(div_1y.sum())
+                dy = div_total / last_price
+            else:
+                dy = 0.0
+        else:
+            dy = None
+    except Exception:
+        dy = None
+
     out["DividendYield"] = dy
     dividend_ok = (dy is not None) and (dy >= 0.02)
     if dy is None:
@@ -751,9 +574,7 @@ def analyze_one(code: str, now_jst: datetime, adv3m_map: dict, last_close_map: d
     graham_2_3_ok = (adj_ncav is not None) and (mcap is not None) and (mcap < adj_ncav * (2.0 / 3.0))
 
     out["Size_OK"] = bool(size_ok) if mcap is not None else None
-    out["Liquidity_OK"] = bool(liq_ok) if adv3m is not None else None
-    out["Sector_OK"] = bool(sector_ok) if sector_raw is not None else None
-
+    out["Sector_OK"] = bool(sector_ok) if sector_jp is not None else None
     out["AdjNetNet_OK"] = bool(adj_netnet_ok) if adj_ncav is not None and mcap is not None else None
     out["Graham_2_3_OK"] = bool(graham_2_3_ok) if adj_ncav is not None and mcap is not None else None
     out["OCF_2Y_OK"] = bool(ocf_2y_ok) if (ocf1 is not None and ocf2 is not None) else None
@@ -765,9 +586,9 @@ def analyze_one(code: str, now_jst: datetime, adv3m_map: dict, last_close_map: d
 
     # ハード制約
     hard_ok = True
-    if not size_ok or not liq_ok or not sector_ok:
+    if not size_ok or not sector_ok:
         hard_ok = False
-    if mcap is None or adv3m is None or sector_raw is None or adj_ncav is None or dy is None or net_cash is None or ocf1 is None or ocf2 is None:
+    if mcap is None or sector_jp is None or adj_ncav is None or dy is None or net_cash is None or ocf1 is None or ocf2 is None:
         hard_ok = False
 
     final = "✘"
@@ -791,8 +612,7 @@ def analyze_one(code: str, now_jst: datetime, adv3m_map: dict, last_close_map: d
                 else:
                     final = "✘"
 
-    # ここが高速化の主眼：
-    # Split/Sharesは「△の昇格判定に必要なときだけ」取得する（500銘柄でshares_full連発を避ける）
+    # △の昇格判定に必要なときだけSharesデータを取得
     if final == "△" and hard_ok:
         split3y, split_reason = split_flag_3y(t, now_jst)
         out["Split_3Y_Flag"] = bool(split3y)
@@ -807,7 +627,6 @@ def analyze_one(code: str, now_jst: datetime, adv3m_map: dict, last_close_map: d
             if score_reason:
                 reasons.append(score_reason)
 
-        # 加点で△→◯（◎には影響なし / split3yなら無効）
         if (not split3y):
             score_val = out.get("Shares_Reduction_Score")
             if isinstance(score_val, (int, float)) and score_val >= 2 and netcash_ok:
@@ -843,25 +662,19 @@ def main():
     cfg = load_config_from_env()
     ws = open_worksheet(cfg)
 
-    # 最適化: シート全体を読み込み、コードと既存の企業名マップを取得
     codes, name_cache = read_sheet_data(ws)
     if not codes:
         print("No codes found in column A.")
         return
     
-    # 2500銘柄は多いのでログ出し
     print(f"Start processing {len(codes)} stocks at {now_jst.isoformat()}")
-
-    tickers = [to_ticker(c) for c in codes]
-    adv3m_map, last_close_map = build_price_cache(tickers)
 
     results = []
     
-    # 最適化: ThreadPoolExecutorで並列処理
-    # エラー(429/401)回避のため max_workers を 4 -> 2 に下げて安定化
-    with ThreadPoolExecutor(max_workers=2) as executor:
+    # 並列数を4に増加（API負荷軽減のため）
+    with ThreadPoolExecutor(max_workers=4) as executor:
         future_to_code = {
-            executor.submit(analyze_one, c, now_jst, adv3m_map, last_close_map, name_cache): c 
+            executor.submit(analyze_one, c, now_jst, name_cache): c 
             for c in codes
         }
         
@@ -871,7 +684,6 @@ def main():
                 res = future.result()
                 results.append(res)
             except Exception as e:
-                # スレッド内エラーのキャッチ
                 results.append({
                     "code": code,
                     "ticker": to_ticker(code),
@@ -879,30 +691,23 @@ def main():
                     "Reason": f"EXCEPTION:{type(e).__name__}",
                 })
             
-            # 進捗表示 (100件ごと)
             if (i + 1) % 100 == 0:
                 print(f"Processed {i + 1}/{len(codes)}...")
 
-    # 結果を元の順序（codesの順）に戻す
     code_order = {c: i for i, c in enumerate(codes)}
     results.sort(key=lambda x: code_order.get(x["code"], 99999))
 
     df = pd.DataFrame(results)
 
-    # 出力用：日本語ヘッダー＋表示変換（億円・Reason日本語化）
-    # ※計算はすべて円で行い、スプシ表示だけ億円にする
+    # 項目削除を反映したヘッダー
     jp_headers = [
         "銘柄コード",
         "企業名",
         "セクター",
-        "業種",
         "時価総額(億円)",
-        "平均日次売買代金3か月(億円)",
         "時価総額OK",
-        "流動性OK",
         "セクターOK",
         "現金(億円)",
-        "短期投資(億円)",
         "売掛金等(億円)",
         "棚卸資産(億円)",
         "その他流動資産(億円)",
@@ -929,19 +734,14 @@ def main():
         "理由",
     ]
 
-    # 欠損列を補完（既存ロジックを壊さない）
     needed = [
         "code",
         "CompanyName",
         "SectorJP",
-        "IndustryJP",
         "MarketCap",
-        "AvgDailyValue3M",
         "Size_OK",
-        "Liquidity_OK",
         "Sector_OK",
         "Cash",
-        "ShortTermInvestments",
         "Receivables",
         "Inventory",
         "OtherCurrentAssets",
@@ -973,12 +773,9 @@ def main():
 
     d = df.copy()
 
-    # 億円変換（表示用）
     oku_cols = [
         "MarketCap",
-        "AvgDailyValue3M",
         "Cash",
-        "ShortTermInvestments",
         "Receivables",
         "Inventory",
         "OtherCurrentAssets",
@@ -996,22 +793,16 @@ def main():
     for c in oku_cols:
         d[c] = d[c].apply(_to_oku)
 
-    # Reason 日本語化
     d["ReasonJP"] = d["Reason"].apply(_reason_jp)
 
-    # 出力順（日本語ヘッダー順に揃える）
     out_df = pd.DataFrame({
         "銘柄コード": d["code"],
         "企業名": d["CompanyName"],
         "セクター": d["SectorJP"],
-        "業種": d["IndustryJP"],
         "時価総額(億円)": d["MarketCap"],
-        "平均日次売買代金3か月(億円)": d["AvgDailyValue3M"],
         "時価総額OK": d["Size_OK"],
-        "流動性OK": d["Liquidity_OK"],
         "セクターOK": d["Sector_OK"],
         "現金(億円)": d["Cash"],
-        "短期投資(億円)": d["ShortTermInvestments"],
         "売掛金等(億円)": d["Receivables"],
         "棚卸資産(億円)": d["Inventory"],
         "その他流動資産(億円)": d["OtherCurrentAssets"],
