@@ -6,7 +6,7 @@ import random
 from dataclasses import dataclass
 from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
-from concurrent.futures import ThreadPoolExecutor, as_completed  # 追加: 並列処理用
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
@@ -305,17 +305,23 @@ def pick_bs_value(bs: pd.DataFrame, candidates: list[str]):
 
 
 def get_latest_balance_sheet(t: yf.Ticker) -> pd.DataFrame:
-    bs = t.balance_sheet
-    if bs is None or bs.empty:
-        bs = t.quarterly_balance_sheet
-    return bs
+    try:
+        bs = t.balance_sheet
+        if bs is None or bs.empty:
+            bs = t.quarterly_balance_sheet
+        return bs
+    except Exception:
+        return None
 
 
 def get_cashflow_annual(t: yf.Ticker) -> pd.DataFrame:
-    cf = t.cashflow
-    if cf is None or cf.empty:
-        cf = t.quarterly_cashflow
-    return cf
+    try:
+        cf = t.cashflow
+        if cf is None or cf.empty:
+            cf = t.quarterly_cashflow
+        return cf
+    except Exception:
+        return None
 
 
 def to_ticker(code: str) -> str:
@@ -368,82 +374,90 @@ def get_sector_industry(info: dict):
 
 def build_price_cache(tickers: list[str]):
     """
-    500銘柄の「平均日次売買代金(3mo)」と「直近終値」を、yfinance download 1回でまとめて取得。
-    個別historyを500回叩かないための高速化ポイント。
+    レートリミット回避のため、100銘柄ずつ分割して取得する
     """
     adv_map = {}
     last_close_map = {}
     if not tickers:
         return adv_map, last_close_map
 
-    try:
-        # downloadはスレッドセーフではない場合があるが、mainで一括実行するため問題なし
-        df = yf.download(
-            tickers=tickers,
-            period="3mo",
-            interval="1d",
-            auto_adjust=False,
-            group_by="ticker",
-            threads=True, 
-            progress=False,
-        )
-        if df is None or df.empty:
-            return adv_map, last_close_map
+    # Chunking to avoid "Failed downloads" and 429 errors
+    chunk_size = 100
+    for i in range(0, len(tickers), chunk_size):
+        chunk = tickers[i : i + chunk_size]
+        try:
+            # サーバー負荷を下げるため少しWait
+            if i > 0:
+                time.sleep(1.5)
 
-        # 1銘柄の場合と複数銘柄で構造が変わるので吸収
-        if isinstance(df.columns, pd.MultiIndex):
-            # columns: (Field, Ticker) もしくは (Ticker, Field) の揺れを吸収
-            lvl0 = list(df.columns.get_level_values(0))
-            
-            if "Close" in set(lvl0) and "Volume" in set(lvl0):
-                # (Field, Ticker)
-                for tk in tickers:
-                    try:
-                        c = df[("Close", tk)].dropna()
-                        v = df[("Volume", tk)].dropna()
-                        if c.empty or v.empty:
+            df = yf.download(
+                tickers=chunk,
+                period="3mo",
+                interval="1d",
+                auto_adjust=False,
+                group_by="ticker",
+                threads=True, 
+                progress=False,
+            )
+            if df is None or df.empty:
+                continue
+
+            # 1銘柄の場合と複数銘柄で構造が変わるので吸収
+            if isinstance(df.columns, pd.MultiIndex):
+                # columns: (Field, Ticker) もしくは (Ticker, Field) の揺れを吸収
+                lvl0 = list(df.columns.get_level_values(0))
+                
+                if "Close" in set(lvl0) and "Volume" in set(lvl0):
+                    # (Field, Ticker)
+                    for tk in chunk:
+                        try:
+                            c = df[("Close", tk)].dropna()
+                            v = df[("Volume", tk)].dropna()
+                            if c.empty or v.empty:
+                                continue
+                            dv = (c * v).dropna()
+                            if not dv.empty:
+                                adv_map[tk] = float(dv.mean())
+                            if not c.empty:
+                                last_close_map[tk] = float(c.iloc[-1])
+                        except Exception:
                             continue
-                        dv = (c * v).dropna()
-                        if not dv.empty:
-                            adv_map[tk] = float(dv.mean())
-                        if not c.empty:
-                            last_close_map[tk] = float(c.iloc[-1])
-                    except Exception:
-                        continue
+                else:
+                    # (Ticker, Field)
+                    for tk in chunk:
+                        try:
+                            if (tk, "Close") not in df.columns or (tk, "Volume") not in df.columns:
+                                continue
+                            c = df[(tk, "Close")].dropna()
+                            v = df[(tk, "Volume")].dropna()
+                            if c.empty or v.empty:
+                                continue
+                            dv = (c * v).dropna()
+                            if not dv.empty:
+                                adv_map[tk] = float(dv.mean())
+                            if not c.empty:
+                                last_close_map[tk] = float(c.iloc[-1])
+                        except Exception:
+                            continue
             else:
-                # (Ticker, Field)
-                for tk in tickers:
-                    try:
-                        if (tk, "Close") not in df.columns or (tk, "Volume") not in df.columns:
-                            continue
-                        c = df[(tk, "Close")].dropna()
-                        v = df[(tk, "Volume")].dropna()
-                        if c.empty or v.empty:
-                            continue
+                # 単一銘柄(chunk size=1 or result is single)
+                try:
+                    tk = chunk[0] # 単一なら最初のTickerと仮定
+                    if "Close" in df.columns and "Volume" in df.columns:
+                        c = df["Close"].dropna()
+                        v = df["Volume"].dropna()
                         dv = (c * v).dropna()
                         if not dv.empty:
                             adv_map[tk] = float(dv.mean())
                         if not c.empty:
                             last_close_map[tk] = float(c.iloc[-1])
-                    except Exception:
-                        continue
-        else:
-            # 単一銘柄：columns = Close, Volume, ...
-            try:
-                if "Close" in df.columns and "Volume" in df.columns:
-                    c = df["Close"].dropna()
-                    v = df["Volume"].dropna()
-                    dv = (c * v).dropna()
-                    if not dv.empty:
-                        adv_map[tickers[0]] = float(dv.mean())
-                    if not c.empty:
-                        last_close_map[tickers[0]] = float(c.iloc[-1])
-            except Exception:
-                pass
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"Chunk download failed: {e}")
+            continue
 
-        return adv_map, last_close_map
-    except Exception:
-        return adv_map, last_close_map
+    return adv_map, last_close_map
 
 
 def dividend_yield_trailing(t: yf.Ticker, info: dict, last_close: float | None):
@@ -578,12 +592,12 @@ def shares_reduction_score_3y(t: yf.Ticker, now_jst: datetime) -> tuple[object, 
 
 
 # ----------------------------
-# 4) 1銘柄解析（最適化版）
+# 4) 1銘柄解析（最適化・安定化版）
 # ----------------------------
 def analyze_one(code: str, now_jst: datetime, adv3m_map: dict, last_close_map: dict, name_cache: dict) -> dict:
-    """
-    最適化: name_cacheを受け取り、既存の企業名を再利用する
-    """
+    # 401/429エラー回避のためのランダムWait（ジッター）
+    time.sleep(random.uniform(0.5, 1.5))
+    
     out = {"code": code}
     reasons = []
 
@@ -844,8 +858,8 @@ def main():
     results = []
     
     # 最適化: ThreadPoolExecutorで並列処理
-    # max_workers=4 は GitHub Actions (2-coreが多い) と yfinanceのレートリミット的に安全なライン
-    with ThreadPoolExecutor(max_workers=4) as executor:
+    # エラー(429/401)回避のため max_workers を 4 -> 2 に下げて安定化
+    with ThreadPoolExecutor(max_workers=2) as executor:
         future_to_code = {
             executor.submit(analyze_one, c, now_jst, adv3m_map, last_close_map, name_cache): c 
             for c in codes
@@ -870,7 +884,6 @@ def main():
                 print(f"Processed {i + 1}/{len(codes)}...")
 
     # 結果を元の順序（codesの順）に戻す
-    # ThreadPoolは完了順に出てくるため、並び替えないとスプレッドシートの行とずれる可能性がある（今回は全書き換えなので問題ないが、念のため）
     code_order = {c: i for i, c in enumerate(codes)}
     results.sort(key=lambda x: code_order.get(x["code"], 99999))
 
