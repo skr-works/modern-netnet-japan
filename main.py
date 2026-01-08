@@ -386,7 +386,7 @@ def shares_reduction_score_3y(t: yf.Ticker, now_jst: datetime) -> tuple[object, 
 
 
 # ----------------------------
-# 4) 1銘柄解析（超高速化・列ズレ修正版）
+# 4) 1銘柄解析（超高速化・列ズレ修正・順序修正版）
 # ----------------------------
 def analyze_one(code: str, now_jst: datetime, name_cache: dict) -> dict:
     time.sleep(random.uniform(0.5, 1.5))
@@ -399,21 +399,35 @@ def analyze_one(code: str, now_jst: datetime, name_cache: dict) -> dict:
 
     t = yf.Ticker(ticker)
 
-    # 1. 時価総額の門前払い（fast_infoで高速チェック）
-    # yfinanceのFastInfoオブジェクトはdictではなく.get()がないため、[]でアクセスする
-    # キー名は 'marketCap'
+    # 1. 企業名と業種(JP)の取得
+    # 時価総額チェックの前に移動し、門前払いされた場合でも名前が入るように修正
+    existing_name = name_cache.get(code)
+    company_jp, sector_jp = fetch_yahoo_jp_data(ticker, existing_name)
+    
+    if company_jp is None:
+        reasons.append("NO_JP_NAME")
+    out["CompanyName"] = company_jp
+    
+    out["SectorJP"] = sector_jp 
+
+    sector_ok = (sector_jp is not None)
+    if sector_jp and any(x in sector_jp for x in ["銀行", "証券", "保険", "金融"]):
+        sector_ok = False
+        reasons.append("FINANCIAL_SECTOR_EXCLUDED")
+    if sector_jp is None:
+        reasons.append("SECTOR_UNKNOWN")
+
+    # 2. 時価総額の門前払い（fast_infoで高速チェック）
     mcap = None
     try:
         if hasattr(t, "fast_info"):
             try:
                 mcap = t.fast_info["marketCap"]
             except KeyError:
-                # バージョン揺れ対応
                 if "market_cap" in t.fast_info:
                     mcap = t.fast_info["market_cap"]
         
         if mcap is not None and mcap < 3_000_000_000:
-            # 30億未満なら即リターン
             out["MarketCap"] = mcap
             out["Size_OK"] = False
             out["Final"] = "✘"
@@ -429,25 +443,6 @@ def analyze_one(code: str, now_jst: datetime, name_cache: dict) -> dict:
     elif not size_ok:
         reasons.append("SIZE<30億")
 
-    # 2. 企業名と業種(JP)の取得
-    existing_name = name_cache.get(code)
-    company_jp, sector_jp = fetch_yahoo_jp_data(ticker, existing_name)
-    
-    if company_jp is None:
-        reasons.append("NO_JP_NAME")
-    out["CompanyName"] = company_jp
-    
-    # 英語のIndustry情報は一切取得・保持しない
-    out["SectorJP"] = sector_jp 
-
-    sector_ok = (sector_jp is not None)
-    # 金融などの除外判定（日本語）
-    if sector_jp and any(x in sector_jp for x in ["銀行", "証券", "保険", "金融"]):
-        sector_ok = False
-        reasons.append("FINANCIAL_SECTOR_EXCLUDED")
-    if sector_jp is None:
-        reasons.append("SECTOR_UNKNOWN")
-
     # 3. 財務データの取得
     if not size_ok:
         out["Size_OK"] = False
@@ -459,7 +454,6 @@ def analyze_one(code: str, now_jst: datetime, name_cache: dict) -> dict:
 
     cash = pick_bs_value(bs, ["Cash And Cash Equivalents", "Cash And Cash Equivalents And Short Term Investments", "Cash"])
     
-    # 短期投資は個別取得を廃止 (0扱い)
     sti = 0.0 
     
     receivables = pick_bs_value(bs, ["Net Receivables", "Accounts Receivable", "Receivables"])
@@ -467,7 +461,6 @@ def analyze_one(code: str, now_jst: datetime, name_cache: dict) -> dict:
     other_ca = pick_bs_value(bs, ["Other Current Assets", "Other current assets"])
     total_ca = pick_bs_value(bs, ["Total Current Assets", "Current Assets"])
 
-    # その他流動資産の計算
     if other_ca is None and total_ca is not None:
         parts = [cash or 0.0, sti or 0.0, receivables or 0.0, inventory or 0.0]
         other_ca = total_ca - sum(parts)
@@ -516,7 +509,6 @@ def analyze_one(code: str, now_jst: datetime, name_cache: dict) -> dict:
     if ocf1 is None or ocf2 is None:
         reasons.append("NO_OCF2Y")
 
-    # 配当利回り (fast_infoを使用。ここも[]アクセスに修正)
     try:
         last_price = None
         if hasattr(t, "fast_info"):
@@ -617,7 +609,6 @@ def analyze_one(code: str, now_jst: datetime, name_cache: dict) -> dict:
                 else:
                     final = "✘"
 
-    # △の昇格判定
     if final == "△" and hard_ok:
         split3y, split_reason = split_flag_3y(t, now_jst)
         out["Split_3Y_Flag"] = bool(split3y)
@@ -703,7 +694,6 @@ def main():
 
     df = pd.DataFrame(results)
 
-    # 日本語ヘッダー (最終判定を移動)
     jp_headers = [
         "銘柄コード",
         "企業名",
@@ -799,7 +789,6 @@ def main():
 
     d["ReasonJP"] = d["Reason"].apply(_reason_jp)
 
-    # 最終的な列マッピング
     out_df = pd.DataFrame({
         "銘柄コード": d["code"],
         "企業名": d["CompanyName"],
