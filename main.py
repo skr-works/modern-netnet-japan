@@ -1,6 +1,8 @@
 import json
 import os
 import re
+import time
+import random
 from dataclasses import dataclass
 from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
@@ -14,6 +16,8 @@ from google.oauth2.service_account import Credentials
 
 import holidays
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 JST = ZoneInfo("Asia/Tokyo")
 
@@ -104,6 +108,18 @@ def _reason_jp(reason_csv: str) -> str:
     return "、".join(uniq)
 
 
+# --- HTTPセッション（企業名スクレイピングの安定化・軽いリトライ） ---
+_HTTP_SESSION = requests.Session()
+_retry = Retry(
+    total=2,
+    backoff_factor=0.5,
+    status_forcelist=(429, 500, 502, 503, 504),
+    allowed_methods=frozenset(["GET"]),
+)
+_HTTP_SESSION.mount("https://", HTTPAdapter(max_retries=_retry))
+_HTTP_SESSION.mount("http://", HTTPAdapter(max_retries=_retry))
+
+
 def get_japanese_name(ticker_code: str):
     """
     Yahoo!ファイナンス(日本)からスクレイピングで銘柄名(日本語)を取得する
@@ -122,12 +138,14 @@ def get_japanese_name(ticker_code: str):
         code_t = f"{base}.T"
         url = f"https://finance.yahoo.co.jp/quote/{code_t}"
 
+        # BAN回避寄り：ごく小さなジッター（並列化しない前提）
+        time.sleep(0.03 + random.random() * 0.05)
+
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-        res = requests.get(url, headers=headers, timeout=5)
+        res = _HTTP_SESSION.get(url, headers=headers, timeout=5)
         res.encoding = res.apparent_encoding
 
         # <title>住友商事(株)【8053】：株価・株式情報 - Yahoo!ファイナンス</title>
-        # のような形を想定
         m = re.search(r"<title>\s*(.*?)\s*(?:【|\|)", res.text, flags=re.IGNORECASE | re.DOTALL)
         if m:
             name = re.sub(r"\s+", " ", m.group(1)).strip()
@@ -288,7 +306,15 @@ def to_ticker(code: str) -> str:
     return f"{s}.T"
 
 
-def get_market_cap(t: yf.Ticker):
+def get_info_safe(t: yf.Ticker):
+    try:
+        info = t.get_info()
+        return info if isinstance(info, dict) else {}
+    except Exception:
+        return {}
+
+
+def get_market_cap(t: yf.Ticker, info: dict | None = None):
     try:
         fi = getattr(t, "fast_info", {}) or {}
         mc = fi.get("market_cap")
@@ -297,8 +323,10 @@ def get_market_cap(t: yf.Ticker):
     except Exception:
         pass
 
+    if info is None:
+        info = get_info_safe(t)
+
     try:
-        info = t.get_info()
         mc = info.get("marketCap")
         if mc is not None:
             return float(mc)
@@ -308,47 +336,97 @@ def get_market_cap(t: yf.Ticker):
     return None
 
 
-def get_sector_industry(t: yf.Ticker):
+def get_sector_industry(info: dict):
     try:
-        info = t.get_info()
+        sector = info.get("sector")
+        industry = info.get("industry")
+        return (str(sector).strip() if sector else None), (str(industry).strip() if industry else None)
     except Exception:
         return None, None
-    sector = info.get("sector")
-    industry = info.get("industry")
-    return (str(sector).strip() if sector else None), (str(industry).strip() if industry else None)
 
 
-def avg_daily_value_3m(t: yf.Ticker):
+def build_price_cache(tickers: list[str]):
+    """
+    500銘柄の「平均日次売買代金(3mo)」と「直近終値」を、yfinance download 1回でまとめて取得。
+    個別historyを500回叩かないための高速化ポイント。
+    """
+    adv_map = {}
+    last_close_map = {}
+    if not tickers:
+        return adv_map, last_close_map
+
     try:
-        hist = t.history(period="3mo", auto_adjust=False)
-        if hist is None or hist.empty:
-            return None
-        if "Close" not in hist.columns or "Volume" not in hist.columns:
-            return None
-        dv = (hist["Close"] * hist["Volume"]).dropna()
-        if dv.empty:
-            return None
-        return float(dv.mean())
+        df = yf.download(
+            tickers=tickers,
+            period="3mo",
+            interval="1d",
+            auto_adjust=False,
+            group_by="ticker",
+            threads=True,
+            progress=False,
+        )
+        if df is None or df.empty:
+            return adv_map, last_close_map
+
+        # 1銘柄の場合と複数銘柄で構造が変わるので吸収
+        if isinstance(df.columns, pd.MultiIndex):
+            # columns: (Field, Ticker) もしくは (Ticker, Field) の揺れを吸収
+            lvl0 = list(df.columns.get_level_values(0))
+            lvl1 = list(df.columns.get_level_values(1))
+
+            if "Close" in set(lvl0) and "Volume" in set(lvl0):
+                # (Field, Ticker)
+                for tk in tickers:
+                    try:
+                        c = df[("Close", tk)].dropna()
+                        v = df[("Volume", tk)].dropna()
+                        if c.empty or v.empty:
+                            continue
+                        dv = (c * v).dropna()
+                        if not dv.empty:
+                            adv_map[tk] = float(dv.mean())
+                        if not c.empty:
+                            last_close_map[tk] = float(c.iloc[-1])
+                    except Exception:
+                        continue
+            else:
+                # (Ticker, Field)
+                for tk in tickers:
+                    try:
+                        if (tk, "Close") not in df.columns or (tk, "Volume") not in df.columns:
+                            continue
+                        c = df[(tk, "Close")].dropna()
+                        v = df[(tk, "Volume")].dropna()
+                        if c.empty or v.empty:
+                            continue
+                        dv = (c * v).dropna()
+                        if not dv.empty:
+                            adv_map[tk] = float(dv.mean())
+                        if not c.empty:
+                            last_close_map[tk] = float(c.iloc[-1])
+                    except Exception:
+                        continue
+        else:
+            # 単一銘柄：columns = Close, Volume, ...
+            try:
+                if "Close" in df.columns and "Volume" in df.columns:
+                    c = df["Close"].dropna()
+                    v = df["Volume"].dropna()
+                    dv = (c * v).dropna()
+                    if not dv.empty:
+                        adv_map[tickers[0]] = float(dv.mean())
+                    if not c.empty:
+                        last_close_map[tickers[0]] = float(c.iloc[-1])
+            except Exception:
+                pass
+
+        return adv_map, last_close_map
     except Exception:
-        return None
+        return adv_map, last_close_map
 
 
-def last_close_price(t: yf.Ticker):
+def dividend_yield_trailing(t: yf.Ticker, info: dict, last_close: float | None):
     try:
-        hist = t.history(period="5d", auto_adjust=False)
-        if hist is None or hist.empty:
-            return None
-        close = hist["Close"].dropna()
-        if close.empty:
-            return None
-        return float(close.iloc[-1])
-    except Exception:
-        return None
-
-
-def dividend_yield_trailing(t: yf.Ticker):
-    try:
-        info = t.get_info()
         dy = info.get("dividendYield")
         if dy is not None:
             dyf = float(dy)
@@ -364,7 +442,8 @@ def dividend_yield_trailing(t: yf.Ticker):
         cutoff = pd.Timestamp.utcnow() - pd.Timedelta(days=365)
         div_1y = div[div.index >= cutoff]
         total = float(div_1y.sum()) if not div_1y.empty else 0.0
-        price = last_close_price(t)
+
+        price = last_close
         if price is None or price <= 0:
             return None
         return total / price
@@ -480,7 +559,7 @@ def shares_reduction_score_3y(t: yf.Ticker, now_jst: datetime) -> tuple[object, 
 # ----------------------------
 # 4) 1銘柄解析（仕様どおり）
 # ----------------------------
-def analyze_one(code: str, now_jst: datetime) -> dict:
+def analyze_one(code: str, now_jst: datetime, adv3m_map: dict, last_close_map: dict) -> dict:
     out = {"code": code}
     reasons = []
 
@@ -495,8 +574,11 @@ def analyze_one(code: str, now_jst: datetime) -> dict:
         reasons.append("NO_JP_NAME")
     out["CompanyName"] = company_jp
 
+    # infoは1回だけ取得（get_info多重呼び出しを削減）
+    info = get_info_safe(t)
+
     # セクター/業種（判定は英語の生値で行い、表示は日本語化した値を別列に出す）
-    sector_raw, industry_raw = get_sector_industry(t)
+    sector_raw, industry_raw = get_sector_industry(info)
     out["SectorRaw"] = sector_raw
     out["IndustryRaw"] = industry_raw
     out["SectorJP"] = _sector_jp(sector_raw)
@@ -508,8 +590,11 @@ def analyze_one(code: str, now_jst: datetime) -> dict:
     elif sector_raw == "Financial Services":
         reasons.append("FINANCIAL_SECTOR_EXCLUDED")
 
-    mcap = get_market_cap(t)
-    adv3m = avg_daily_value_3m(t)
+    mcap = get_market_cap(t, info=info)
+
+    # 3か月平均日次売買代金は、download一括取得したキャッシュを優先
+    adv3m = adv3m_map.get(ticker)
+
     out["MarketCap"] = mcap
     out["AvgDailyValue3M"] = adv3m
 
@@ -584,7 +669,8 @@ def analyze_one(code: str, now_jst: datetime) -> dict:
     if ocf1 is None or ocf2 is None:
         reasons.append("NO_OCF2Y")
 
-    dy = dividend_yield_trailing(t)
+    last_close = last_close_map.get(ticker)
+    dy = dividend_yield_trailing(t, info=info, last_close=last_close)
     out["DividendYield"] = dy
     dividend_ok = (dy is not None) and (dy >= 0.02)
     if dy is None:
@@ -624,19 +710,6 @@ def analyze_one(code: str, now_jst: datetime) -> dict:
     adj_netnet_ok = (adj_ncav is not None) and (mcap is not None) and (mcap < adj_ncav)
     graham_2_3_ok = (adj_ncav is not None) and (mcap is not None) and (mcap < adj_ncav * (2.0 / 3.0))
 
-    split3y, split_reason = split_flag_3y(t, now_jst)
-    out["Split_3Y_Flag"] = bool(split3y)
-    if split_reason:
-        reasons.append(split_reason)
-
-    score, score_reason = shares_reduction_score_3y(t, now_jst)
-    if split3y:
-        out["Shares_Reduction_Score"] = 0
-    else:
-        out["Shares_Reduction_Score"] = score
-        if score_reason:
-            reasons.append(score_reason)
-
     out["Size_OK"] = bool(size_ok) if mcap is not None else None
     out["Liquidity_OK"] = bool(liq_ok) if adv3m is not None else None
     out["Sector_OK"] = bool(sector_ok) if sector_raw is not None else None
@@ -645,6 +718,10 @@ def analyze_one(code: str, now_jst: datetime) -> dict:
     out["Graham_2_3_OK"] = bool(graham_2_3_ok) if adj_ncav is not None and mcap is not None else None
     out["OCF_2Y_OK"] = bool(ocf_2y_ok) if (ocf1 is not None and ocf2 is not None) else None
     out["Dividend_OK"] = bool(dividend_ok) if dy is not None else None
+
+    # ここではデフォルト（重い取得は「必要時だけ」行う）
+    out["Split_3Y_Flag"] = False
+    out["Shares_Reduction_Score"] = None
 
     # ハード制約
     hard_ok = True
@@ -674,22 +751,38 @@ def analyze_one(code: str, now_jst: datetime) -> dict:
                 else:
                     final = "✘"
 
-    # 加点で△→◯（◎には影響なし / split3yなら無効）
-    if final == "△" and (not split3y):
-        score_val = out.get("Shares_Reduction_Score")
-        if isinstance(score_val, (int, float)) and score_val >= 2 and netcash_ok:
-            if adj_ratio is not None and 0.90 <= adj_ratio < 1.00 and ocf_2y_ok and dividend_ok and netcash_ok:
-                final = "◯"
-                reasons.append("UPGRADED_BY_SHARES_SCORE")
-            elif adj_netnet_ok:
-                unmet = 0
-                unmet += 0 if ocf_2y_ok else 1
-                unmet += 0 if dividend_ok else 1
-                unmet += 0 if netcash_ok else 1
-                if unmet == 1 and netcash_ok:
-                    if (not ocf_2y_ok) or (not dividend_ok):
-                        final = "◯"
-                        reasons.append("UPGRADED_BY_SHARES_SCORE")
+    # ここが高速化の主眼：
+    # Split/Sharesは「△の昇格判定に必要なときだけ」取得する（500銘柄でshares_full連発を避ける）
+    if final == "△" and hard_ok:
+        split3y, split_reason = split_flag_3y(t, now_jst)
+        out["Split_3Y_Flag"] = bool(split3y)
+        if split_reason:
+            reasons.append(split_reason)
+
+        if split3y:
+            out["Shares_Reduction_Score"] = 0
+        else:
+            score, score_reason = shares_reduction_score_3y(t, now_jst)
+            out["Shares_Reduction_Score"] = score
+            if score_reason:
+                reasons.append(score_reason)
+
+        # 加点で△→◯（◎には影響なし / split3yなら無効）
+        if (not split3y):
+            score_val = out.get("Shares_Reduction_Score")
+            if isinstance(score_val, (int, float)) and score_val >= 2 and netcash_ok:
+                if adj_ratio is not None and 0.90 <= adj_ratio < 1.00 and ocf_2y_ok and dividend_ok and netcash_ok:
+                    final = "◯"
+                    reasons.append("UPGRADED_BY_SHARES_SCORE")
+                elif adj_netnet_ok:
+                    unmet = 0
+                    unmet += 0 if ocf_2y_ok else 1
+                    unmet += 0 if dividend_ok else 1
+                    unmet += 0 if netcash_ok else 1
+                    if unmet == 1 and netcash_ok:
+                        if (not ocf_2y_ok) or (not dividend_ok):
+                            final = "◯"
+                            reasons.append("UPGRADED_BY_SHARES_SCORE")
 
     out["Final"] = final
     out["Reason"] = ",".join(sorted(set(reasons))) if reasons else ""
@@ -715,10 +808,13 @@ def main():
         print("No codes found in column A.")
         return
 
+    tickers = [to_ticker(c) for c in codes]
+    adv3m_map, last_close_map = build_price_cache(tickers)
+
     results = []
     for c in codes:
         try:
-            results.append(analyze_one(c, now_jst))
+            results.append(analyze_one(c, now_jst, adv3m_map, last_close_map))
         except Exception as e:
             results.append({
                 "code": c,
