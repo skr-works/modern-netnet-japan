@@ -16,6 +16,101 @@ import holidays
 JST = ZoneInfo("Asia/Tokyo")
 
 
+# --- 日本語化・表示変換（出力用） -----------------
+
+SECTOR_JP_MAP = {
+    "Basic Materials": "素材",
+    "Communication Services": "通信サービス",
+    "Consumer Cyclical": "一般消費財",
+    "Consumer Defensive": "生活必需品",
+    "Energy": "エネルギー",
+    "Financial Services": "金融",
+    "Healthcare": "ヘルスケア",
+    "Industrials": "資本財・サービス",
+    "Real Estate": "不動産",
+    "Technology": "情報技術",
+    "Utilities": "公益事業",
+}
+
+# Industryは粒度が細かく全網羅は難しいため、代表的なものだけマップし、未定義は原文を出す
+INDUSTRY_JP_MAP = {
+    "Conglomerates": "複合企業",
+    "Oil & Gas E&P": "石油・ガス（探鉱・生産）",
+}
+
+REASON_JP_MAP = {
+    "SECTOR_UNKNOWN": "セクター取得不可",
+    "FINANCIAL_SECTOR_EXCLUDED": "金融セクター除外",
+    "NO_MCAP": "時価総額取得不可",
+    "SIZE<30億": "時価総額30億未満",
+    "NO_ADV3M": "平均日次売買代金（3か月）取得不可",
+    "LIQ<1000万": "平均日次売買代金1,000万円未満",
+    "NO_OCF2Y": "営業CF（直近2年）取得不可",
+    "NO_DIV_YIELD": "配当利回り取得不可",
+    "NO_CASH": "現金（Cash）取得不可",
+    "NO_DEBT": "有利子負債（Debt）取得不可",
+    "NO_ADJNCAV_INPUT": "Adjusted NCAV計算に必要なB/S項目不足",
+    "SPLIT_3Y": "過去3年に分割/併合あり（加点無効）",
+    "NO_SHARES": "発行済株式数推移（Shares）取得不可",
+    "UPGRADED_BY_SHARES_SCORE": "株数減少スコアで△→◯に昇格",
+    "EXCEPTION:": "例外発生",
+    "CONDITION_NOT_MET": "条件未達",
+}
+
+
+def _to_oku(v):
+    """円→億円（表示用）。None/空はそのまま。"""
+    if v is None:
+        return None
+    try:
+        return float(v) / 1e8
+    except Exception:
+        return None
+
+
+def _sector_jp(sector_raw):
+    if sector_raw is None:
+        return None
+    return SECTOR_JP_MAP.get(sector_raw, sector_raw)
+
+
+def _industry_jp(industry_raw):
+    if industry_raw is None:
+        return None
+    return INDUSTRY_JP_MAP.get(industry_raw, industry_raw)
+
+
+def _reason_jp(reason_csv: str) -> str:
+    if not reason_csv:
+        return ""
+    parts = [p.strip() for p in str(reason_csv).split(",") if p.strip()]
+    out = []
+    for p in parts:
+        # EXCEPTION:〇〇 はプレフィクス一致で日本語化
+        if p.startswith("EXCEPTION:"):
+            out.append(REASON_JP_MAP["EXCEPTION:"] + f"（{p}）")
+        else:
+            out.append(REASON_JP_MAP.get(p, p))
+    # 重複除去（順序保持）
+    seen = set()
+    uniq = []
+    for x in out:
+        if x not in seen:
+            uniq.append(x)
+            seen.add(x)
+    return "、".join(uniq)
+
+
+def get_company_name(t: yf.Ticker):
+    """企業名（可能なら日本語名）"""
+    try:
+        info = t.get_info()
+        name = info.get("longName") or info.get("shortName") or info.get("name")
+        return str(name).strip() if name else None
+    except Exception:
+        return None
+
+
 # ----------------------------
 # 0) 実行ガード（週末・祝日・年末年始）
 # ----------------------------
@@ -360,14 +455,21 @@ def analyze_one(code: str, now_jst: datetime) -> dict:
 
     t = yf.Ticker(ticker)
 
-    sector, industry = get_sector_industry(t)
-    out["Sector"] = sector
-    out["Industry"] = industry
+    # 企業名（追加）
+    company = get_company_name(t)
+    out["CompanyName"] = company
 
-    sector_ok = (sector is not None) and (sector != "Financial Services")
-    if sector is None:
+    # セクター/業種（判定は英語の生値で行い、表示は日本語化した値を別列に出す）
+    sector_raw, industry_raw = get_sector_industry(t)
+    out["SectorRaw"] = sector_raw
+    out["IndustryRaw"] = industry_raw
+    out["SectorJP"] = _sector_jp(sector_raw)
+    out["IndustryJP"] = _industry_jp(industry_raw)
+
+    sector_ok = (sector_raw is not None) and (sector_raw != "Financial Services")
+    if sector_raw is None:
         reasons.append("SECTOR_UNKNOWN")
-    elif sector == "Financial Services":
+    elif sector_raw == "Financial Services":
         reasons.append("FINANCIAL_SECTOR_EXCLUDED")
 
     mcap = get_market_cap(t)
@@ -501,7 +603,7 @@ def analyze_one(code: str, now_jst: datetime) -> dict:
 
     out["Size_OK"] = bool(size_ok) if mcap is not None else None
     out["Liquidity_OK"] = bool(liq_ok) if adv3m is not None else None
-    out["Sector_OK"] = bool(sector_ok) if sector is not None else None
+    out["Sector_OK"] = bool(sector_ok) if sector_raw is not None else None
 
     out["AdjNetNet_OK"] = bool(adj_netnet_ok) if adj_ncav is not None and mcap is not None else None
     out["Graham_2_3_OK"] = bool(graham_2_3_ok) if adj_ncav is not None and mcap is not None else None
@@ -512,7 +614,7 @@ def analyze_one(code: str, now_jst: datetime) -> dict:
     hard_ok = True
     if not size_ok or not liq_ok or not sector_ok:
         hard_ok = False
-    if mcap is None or adv3m is None or sector is None or adj_ncav is None or dy is None or net_cash is None or ocf1 is None or ocf2 is None:
+    if mcap is None or adv3m is None or sector_raw is None or adj_ncav is None or dy is None or net_cash is None or ocf1 is None or ocf2 is None:
         hard_ok = False
 
     final = "✘"
@@ -591,11 +693,54 @@ def main():
 
     df = pd.DataFrame(results)
 
-    headers = [
+    # 出力用：日本語ヘッダー＋表示変換（億円・Reason日本語化）
+    # ※計算はすべて円で行い、スプシ表示だけ億円にする
+    jp_headers = [
+        "銘柄コード",
+        "ティッカー",
+        "企業名",
+        "セクター",
+        "業種",
+        "時価総額(億円)",
+        "平均日次売買代金3か月(億円)",
+        "時価総額OK",
+        "流動性OK",
+        "セクターOK",
+        "現金(億円)",
+        "短期投資(億円)",
+        "売掛金等(億円)",
+        "棚卸資産(億円)",
+        "その他流動資産(億円)",
+        "流動資産合計(億円)",
+        "負債合計(億円)",
+        "有利子負債(億円)",
+        "リース負債(億円)",
+        "優先株等(億円)",
+        "少数株主持分(億円)",
+        "ネットキャッシュ(億円)",
+        "ネットキャッシュOK",
+        "Adjusted NCAV(億円)",
+        "AdjNCAV/時価総額",
+        "等倍割れOK",
+        "2/3割れOK",
+        "営業CF FY1(億円)",
+        "営業CF FY2(億円)",
+        "営業CF2年OK",
+        "配当利回り",
+        "配当2%OK",
+        "過去3年分割/併合",
+        "株数減少スコア(0-3)",
+        "最終判定",
+        "理由",
+    ]
+
+    # 欠損列を補完（既存ロジックを壊さない）
+    needed = [
         "code",
         "ticker",
-        "Sector",
-        "Industry",
+        "CompanyName",
+        "SectorJP",
+        "IndustryJP",
         "MarketCap",
         "AvgDailyValue3M",
         "Size_OK",
@@ -628,14 +773,80 @@ def main():
         "Final",
         "Reason",
     ]
+    for c in needed:
+        if c not in df.columns:
+            df[c] = None
 
-    for h in headers:
-        if h not in df.columns:
-            df[h] = None
-    df = df[headers].replace({np.nan: None})
+    d = df.copy()
 
-    ws.update([headers] + df.values.tolist(), "A1")
-    print(f"Updated tab='{cfg.tab}' rows={len(df)} at {now_jst.isoformat()}")
+    # 億円変換（表示用）
+    oku_cols = [
+        "MarketCap",
+        "AvgDailyValue3M",
+        "Cash",
+        "ShortTermInvestments",
+        "Receivables",
+        "Inventory",
+        "OtherCurrentAssets",
+        "TotalCurrentAssets",
+        "TotalLiabilities",
+        "TotalDebt",
+        "LeaseLiabilities",
+        "PreferredEquity",
+        "MinorityInterest",
+        "NetCash",
+        "AdjustedNCAV",
+        "OCF_FY1",
+        "OCF_FY2",
+    ]
+    for c in oku_cols:
+        d[c] = d[c].apply(_to_oku)
+
+    # Reason 日本語化
+    d["ReasonJP"] = d["Reason"].apply(_reason_jp)
+
+    # 出力順（日本語ヘッダー順に揃える）
+    out_df = pd.DataFrame({
+        "銘柄コード": d["code"],
+        "ティッカー": d["ticker"],
+        "企業名": d["CompanyName"],
+        "セクター": d["SectorJP"],
+        "業種": d["IndustryJP"],
+        "時価総額(億円)": d["MarketCap"],
+        "平均日次売買代金3か月(億円)": d["AvgDailyValue3M"],
+        "時価総額OK": d["Size_OK"],
+        "流動性OK": d["Liquidity_OK"],
+        "セクターOK": d["Sector_OK"],
+        "現金(億円)": d["Cash"],
+        "短期投資(億円)": d["ShortTermInvestments"],
+        "売掛金等(億円)": d["Receivables"],
+        "棚卸資産(億円)": d["Inventory"],
+        "その他流動資産(億円)": d["OtherCurrentAssets"],
+        "流動資産合計(億円)": d["TotalCurrentAssets"],
+        "負債合計(億円)": d["TotalLiabilities"],
+        "有利子負債(億円)": d["TotalDebt"],
+        "リース負債(億円)": d["LeaseLiabilities"],
+        "優先株等(億円)": d["PreferredEquity"],
+        "少数株主持分(億円)": d["MinorityInterest"],
+        "ネットキャッシュ(億円)": d["NetCash"],
+        "ネットキャッシュOK": d["NetCash_OK"],
+        "Adjusted NCAV(億円)": d["AdjustedNCAV"],
+        "AdjNCAV/時価総額": d["AdjNCAV_div_MCap"],
+        "等倍割れOK": d["AdjNetNet_OK"],
+        "2/3割れOK": d["Graham_2_3_OK"],
+        "営業CF FY1(億円)": d["OCF_FY1"],
+        "営業CF FY2(億円)": d["OCF_FY2"],
+        "営業CF2年OK": d["OCF_2Y_OK"],
+        "配当利回り": d["DividendYield"],
+        "配当2%OK": d["Dividend_OK"],
+        "過去3年分割/併合": d["Split_3Y_Flag"],
+        "株数減少スコア(0-3)": d["Shares_Reduction_Score"],
+        "最終判定": d["Final"],
+        "理由": d["ReasonJP"],
+    }).replace({np.nan: None})
+
+    ws.update([jp_headers] + out_df.values.tolist(), "A1")
+    print(f"Updated tab='{cfg.tab}' rows={len(out_df)} at {now_jst.isoformat()}")
 
 
 if __name__ == "__main__":
