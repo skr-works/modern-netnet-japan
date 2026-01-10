@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   run:
@@ -15,6 +15,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Python 3.11
         uses: actions/setup-python@v5
@@ -32,3 +34,24 @@ jobs:
           APP_CFG_JSON: ${{ secrets.APP_CFG_JSON }}
         run: |
           python main.py
+
+      - name: Keepalive Workflow
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # 最終コミット日時(UNIX時間)を取得
+          last_commit=$(git log -1 --format=%ct)
+          now=$(date +%s)
+          # 経過日数を計算
+          days=$(( (now - last_commit) / 86400 ))
+          
+          echo "Days since last commit: $days"
+          
+          if [ "$days" -gt 50 ]; then
+            echo "Last commit is older than 50 days. Pushing empty commit to keep workflow active."
+            git commit --allow-empty -m "keepalive: prevent workflow suspension"
+            git push
+          else
+            echo "No action needed."
+          fi
